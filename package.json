@@ -1,0 +1,17 @@
+{
+  "name": "casino-roulette-helper",
+  "version": "1.0.0",
+  "description": "A helper bot to handle Roulette game logic for the main casino bot.",
+  "main": "roulette-helper.js",
+  "type": "module",
+  "scripts": {
+    "start": "node roulette-helper.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^16.3.1",
+    "node-telegram-bot-api": "^0.64.0",
+    "pg": "^8.11.3"
+  }
+}
