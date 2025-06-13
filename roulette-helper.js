@@ -1,4 +1,4 @@
-// roulette-helper.js (Final Version)
+// roulette-helper.js (Final Version - Play Again button removed)
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
@@ -24,11 +24,6 @@ const formatDisplayUSD = (lamports) => {
     const usdValue = (Number(lamports) / 1e9) * approxSolPrice;
     return `$${usdValue.toFixed(2)}`;
 };
-
-const createPostGameKeyboard = (gameId, betAmount) => ({
-    // The main bot no longer has a play_again handler for this, so this button is for show or future use.
-    inline_keyboard: [[{ text: "Play Again?", callback_data: `roulette_noop` }]]
-});
 
 // --- Main Application ---
 const HELPER_BOT_TOKEN = process.env.HELPER_BOT_TOKEN;
@@ -93,7 +88,7 @@ async function handleNewGameSession(mainBotGameId) {
 
 async function handleBettingTimeout(gameId) {
     const logPrefix = `[BetTimeout GID:${gameId}]`;
-    activeTimeouts.delete(gameId);
+    activeTimeouts.delete(gameId); 
     
     let client = null;
     try {
@@ -179,12 +174,14 @@ async function processBet(gameId, betKey, clickerId) {
 
         const finalCaption = `Landed on: <b>${resultDisplay}</b>\nYour Bet: <b>${escapeHTML(betInfo.name)}</b>\n\n${finalPayoutMessage}`;
         
+        // --- START OF FIX ---
+        // The reply_markup property has been removed from this call.
         await bot.editMessageCaption(finalCaption, {
             chat_id: session.chat_id,
             message_id: gameState.helperMessageId,
-            parse_mode: 'HTML',
-            reply_markup: createPostGameKeyboard(gameId, betAmount.toString())
+            parse_mode: 'HTML'
         });
+        // --- END OF FIX ---
         
         await client.query("UPDATE roulette_sessions SET status = $1, game_state_json = $2 WHERE session_id = $3", [`completed_${gameState.outcome}`, JSON.stringify(gameState), session.session_id]);
         await client.query('COMMIT');
@@ -234,6 +231,7 @@ async function listen() {
             try {
                 const payload = JSON.parse(msg.payload);
                 if (payload.main_bot_game_id) {
+                    console.log(`[HelperListener] Received pickup notification for GID: ${payload.main_bot_game_id}`);
                     handleNewGameSession(payload.main_bot_game_id);
                 }
             } catch (e) { console.error('Error parsing pickup notification payload:', e); }
