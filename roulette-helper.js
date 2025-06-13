@@ -1,4 +1,4 @@
-// roulette-helper.js (Corrected Version 5 - With Your Preferred Image)
+// roulette-helper.js (Final Version)
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
@@ -18,12 +18,22 @@ const generateRouletteBettingKeyboard = (gameId) => ({
         [{ text: "❌ Cancel Game", callback_data: `roulette_cancel:${gameId}` }]
     ]
 });
-// --- End Helper Functions ---
 
+const formatDisplayUSD = (lamports) => {
+    const approxSolPrice = 160; 
+    const usdValue = (Number(lamports) / 1e9) * approxSolPrice;
+    return `$${usdValue.toFixed(2)}`;
+};
+
+const createPostGameKeyboard = (gameId, betAmount) => ({
+    // The main bot no longer has a play_again handler for this, so this button is for show or future use.
+    inline_keyboard: [[{ text: "Play Again?", callback_data: `roulette_noop` }]]
+});
 
 // --- Main Application ---
 const HELPER_BOT_TOKEN = process.env.HELPER_BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
+const BETTING_TIMEOUT_MS = 60000;
 
 if (!HELPER_BOT_TOKEN || !DATABASE_URL) {
     console.error("Missing HELPER_BOT_TOKEN or DATABASE_URL in .env file.");
@@ -33,6 +43,7 @@ if (!HELPER_BOT_TOKEN || !DATABASE_URL) {
 const bot = new TelegramBot(HELPER_BOT_TOKEN, { polling: { interval: 1000, autoStart: true } });
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
+const activeTimeouts = new Map();
 let isShuttingDown = false;
 
 async function handleNewGameSession(mainBotGameId) {
@@ -51,11 +62,9 @@ async function handleNewGameSession(mainBotGameId) {
         const botInfo = await bot.getMe();
         await client.query("UPDATE roulette_sessions SET status = 'in_progress', helper_bot_id = $1 WHERE session_id = $2", [botInfo.id, session.session_id]);
         
-        const approxBetUSD = (Number(session.bet_amount_lamports) / 1e9 * 160).toFixed(2);
-        const captionText = `Player: ${escapeHTML(gameState.initiatorName)}\nWager: <b>~$${approxBetUSD}</b>\n\nPlease place your bet:`;
+        const approxBetUSD = formatDisplayUSD(session.bet_amount_lamports);
+        const captionText = `Player: ${escapeHTML(gameState.initiatorName)}\nWager: <b>~${approxBetUSD}</b>\n\nPlease place your bet within ${BETTING_TIMEOUT_MS / 1000} seconds.`;
         
-        // --- START OF FIX ---
-        // Using your new, preferred image link
         const imageUrl = 'https://i.postimg.cc/rpjyGLy2/IMG-2890.jpg';
 
         const sentMsg = await bot.sendPhoto(session.chat_id, imageUrl, {
@@ -63,12 +72,17 @@ async function handleNewGameSession(mainBotGameId) {
             parse_mode: 'HTML',
             reply_markup: generateRouletteBettingKeyboard(mainBotGameId)
         });
-        // --- END OF FIX ---
         
         gameState.helperMessageId = sentMsg.message_id;
         await client.query("UPDATE roulette_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
         
         await client.query('COMMIT');
+        
+        const timeoutId = setTimeout(() => {
+            handleBettingTimeout(mainBotGameId);
+        }, BETTING_TIMEOUT_MS);
+        activeTimeouts.set(mainBotGameId, timeoutId);
+
     } catch (e) {
         if (client) await client.query('ROLLBACK');
         console.error(`${logPrefix} Error handling new game session: ${e.message}`);
@@ -77,8 +91,43 @@ async function handleNewGameSession(mainBotGameId) {
     }
 }
 
+async function handleBettingTimeout(gameId) {
+    const logPrefix = `[BetTimeout GID:${gameId}]`;
+    activeTimeouts.delete(gameId);
+    
+    let client = null;
+    try {
+        client = await pool.connect();
+        await client.query('BEGIN');
+
+        const sessionRes = await client.query("SELECT * FROM roulette_sessions WHERE main_bot_game_id = $1 AND status = 'in_progress' FOR UPDATE", [gameId]);
+        if (sessionRes.rowCount === 0) { await client.query('ROLLBACK'); return; }
+
+        const session = sessionRes.rows[0];
+        const gameState = session.game_state_json || {};
+
+        console.log(`${logPrefix} Player failed to place a bet in time. Cancelling game.`);
+        await bot.editMessageCaption('🎡 This Roulette game has expired due to inactivity. Your original bet has been returned.', { chat_id: session.chat_id, message_id: gameState.helperMessageId, parse_mode: 'HTML', reply_markup: {} });
+
+        gameState.outcome = 'timeout';
+        await client.query("UPDATE roulette_sessions SET status = 'completed_loss', game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+        await client.query('COMMIT');
+    } catch (e) {
+        if (client) await client.query('ROLLBACK');
+        console.error(`${logPrefix} Error processing timeout: ${e.message}`);
+    } finally {
+        if (client) client.release();
+    }
+}
+
 async function processBet(gameId, betKey, clickerId) {
     const logPrefix = `[ProcessBet GID:${gameId}]`;
+    const timeoutId = activeTimeouts.get(gameId);
+    if (timeoutId) {
+        clearTimeout(timeoutId);
+        activeTimeouts.delete(gameId);
+    }
+
     let client = null;
     try {
         client = await pool.connect();
@@ -92,24 +141,16 @@ async function processBet(gameId, betKey, clickerId) {
 
         const gameState = session.game_state_json || {};
         const betInfo = ROULETTE_BETS[betKey];
+        const betAmount = BigInt(session.bet_amount_lamports);
 
         gameState.betType = betInfo.type;
         gameState.betValue = betKey;
-        
-        // The uploaded image has 0 and 00. We will simulate an American wheel (38 slots).
-        const numbers = [...Array(37).keys(), 37]; // Creates numbers 0-36, plus 37 to represent '00'
-        const randomIndex = Math.floor(Math.random() * numbers.length);
-        let resultNumber = numbers[randomIndex];
-        // For display and logic, we'll represent '37' as '00'
+
+        const resultNumber = Math.floor(Math.random() * 38);
         const resultDisplay = resultNumber === 37 ? '00' : resultNumber;
-        
         gameState.winningNumber = resultDisplay;
 
-        // Note: For American Roulette, 0 and 00 cause all outside bets (Red/Black, Even/Odd, etc.) to lose.
-        let isWin = false;
-        if (resultNumber < 37) { // Check if it's not '00'
-             isWin = betInfo.numbers.includes(resultNumber);
-        }
+        const isWin = (resultNumber < 37) && betInfo.numbers.includes(resultNumber);
         
         gameState.outcome = isWin ? 'win' : 'loss';
         gameState.payoutMultiplier = isWin ? (1 + betInfo.payout) : 0;
@@ -119,12 +160,32 @@ async function processBet(gameId, betKey, clickerId) {
         
         await sleep(1500);
         
-        // We don't have a '00' sticker, so we'll use the '0' sticker as a fallback.
         const stickerKey = resultNumber === 37 ? 0 : resultNumber;
         const stickerId = ROULETTE_NUMBER_STICKERS[stickerKey] || ROULETTE_NUMBER_STICKERS.default;
         await bot.sendSticker(session.chat_id, stickerId, { reply_to_message_id: gameState.helperMessageId });
         await sleep(4000);
 
+        let finalPayoutMessage = "";
+        if (isWin) {
+            const preFeePayout = betAmount * BigInt(gameState.payoutMultiplier);
+            const houseFee = BigInt(Math.floor(Number(preFeePayout) * (2/38)));
+            const finalPayout = preFeePayout - houseFee;
+            const payoutDisplay = formatDisplayUSD(finalPayout);
+            finalPayoutMessage = `🎉 <b>You WIN!</b> 🎉\nYour bet on ${escapeHTML(betInfo.name)} paid out!\n\nApproximate Payout: <b>~${payoutDisplay}</b>`;
+        } else {
+            const betDisplay = formatDisplayUSD(betAmount);
+            finalPayoutMessage = `💔 <b>You lost.</b>\nYour wager of <b>~${betDisplay}</b> is lost. Better luck next time!`;
+        }
+
+        const finalCaption = `Landed on: <b>${resultDisplay}</b>\nYour Bet: <b>${escapeHTML(betInfo.name)}</b>\n\n${finalPayoutMessage}`;
+        
+        await bot.editMessageCaption(finalCaption, {
+            chat_id: session.chat_id,
+            message_id: gameState.helperMessageId,
+            parse_mode: 'HTML',
+            reply_markup: createPostGameKeyboard(gameId, betAmount.toString())
+        });
+        
         await client.query("UPDATE roulette_sessions SET status = $1, game_state_json = $2 WHERE session_id = $3", [`completed_${gameState.outcome}`, JSON.stringify(gameState), session.session_id]);
         await client.query('COMMIT');
         
@@ -137,6 +198,9 @@ async function processBet(gameId, betKey, clickerId) {
 }
 
 async function handleCancel(gameId, clickerId) {
+    const timeoutId = activeTimeouts.get(gameId);
+    if (timeoutId) { clearTimeout(timeoutId); activeTimeouts.delete(gameId); }
+
     let client = null;
     try {
         client = await pool.connect();
@@ -148,7 +212,7 @@ async function handleCancel(gameId, clickerId) {
         if (String(session.user_id) !== String(clickerId)) { await client.query('ROLLBACK'); return; }
         
         const gameState = session.game_state_json || {};
-        await bot.editMessageCaption('🎡 Roulette game cancelled by player.', { chat_id: session.chat_id, message_id: gameState.helperMessageId, reply_markup: {} });
+        await bot.editMessageCaption('🎡 Roulette game cancelled by player. Your bet has been returned.', { chat_id: session.chat_id, message_id: gameState.helperMessageId, parse_mode: 'HTML', reply_markup: {} });
 
         gameState.outcome = 'cancelled';
         await client.query("UPDATE roulette_sessions SET status = 'completed_loss', game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
@@ -170,10 +234,9 @@ async function listen() {
             try {
                 const payload = JSON.parse(msg.payload);
                 if (payload.main_bot_game_id) {
-                    console.log(`[HelperListener] Received pickup notification for GID: ${payload.main_bot_game_id}`);
                     handleNewGameSession(payload.main_bot_game_id);
                 }
-            } catch (e) { console.error('Error parsing notification payload:', e); }
+            } catch (e) { console.error('Error parsing pickup notification payload:', e); }
         }
     });
     await client.query('LISTEN roulette_game_pickup');
@@ -193,6 +256,20 @@ bot.on('callback_query', async (callbackQuery) => {
         await handleCancel(gameId, clickerId);
     }
 });
+
+const shutdown = () => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    console.log("Shutting down Roulette Helper...");
+    activeTimeouts.forEach(timeoutId => clearTimeout(timeoutId));
+    pool.end(() => {
+        console.log("DB pool closed.");
+        process.exit(0);
+    });
+};
+
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
 
 listen().catch(err => {
     console.error("Failed to start listener:", err);
