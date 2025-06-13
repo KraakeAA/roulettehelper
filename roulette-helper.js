@@ -1,4 +1,4 @@
-// roulette-helper.js (Corrected Version 2)
+// roulette-helper.js (Corrected Version 3 - With Image)
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
@@ -11,10 +11,6 @@ import { ROULETTE_BETS, ROULETTE_NUMBER_STICKERS } from './lib/roulette-constant
 const escapeHTML = (text) => text ? String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;') : '';
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-/**
- * --- START OF FIX ---
- * This function was missing. It generates the betting keyboard for the user.
- */
 const generateRouletteBettingKeyboard = (gameId) => ({
     inline_keyboard: [
         [{ text: "🔴 Red", callback_data: `roulette_bet:${gameId}:RED` }, { text: "⚫ Black", callback_data: `roulette_bet:${gameId}:BLACK` }],
@@ -26,7 +22,8 @@ const generateRouletteBettingKeyboard = (gameId) => ({
         [{ text: "❌ Cancel Game", callback_data: `roulette_cancel:${gameId}` }]
     ]
 });
-// --- END OF FIX ---
+// --- End Helper Functions ---
+
 
 // --- Main Application ---
 const HELPER_BOT_TOKEN = process.env.HELPER_BOT_TOKEN;
@@ -42,7 +39,7 @@ const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorize
 
 let isShuttingDown = false;
 
-async function handleNewGame(mainBotGameId) {
+async function handleNewGameSession(mainBotGameId) {
     const logPrefix = `[HandleSession GID:${mainBotGameId}]`;
     let client = null;
     try {
@@ -58,11 +55,22 @@ async function handleNewGame(mainBotGameId) {
         const botInfo = await bot.getMe();
         await client.query("UPDATE roulette_sessions SET status = 'in_progress', helper_bot_id = $1 WHERE session_id = $2", [botInfo.id, session.session_id]);
         
-        // This is an approximation for display only, as the helper doesn't have live price feeds.
-        const approxBetUSD = (Number(session.bet_amount_lamports) / 1e9 * 150).toFixed(2);
-        const introMessage = `🎡 <b>Roulette Time!</b> 🎡\n\nPlayer: ${escapeHTML(gameState.initiatorName)}\nWager: <b>~$${approxBetUSD}</b>\n\nPlease place your bet:`;
+        // --- START OF MODIFICATION ---
         
-        const sentMsg = await bot.sendMessage(session.chat_id, introMessage, { parse_mode: 'HTML', reply_markup: generateRouletteBettingKeyboard(mainBotGameId) });
+        // This is an approximation for display only, as the helper doesn't have live price feeds.
+        // A better approach would be for the main bot to pass the USD value in the game_state_json.
+        const approxBetUSD = (Number(session.bet_amount_lamports) / 1e9 * 160).toFixed(2); // Using a rough estimate
+        const captionText = `Player: ${escapeHTML(gameState.initiatorName)}\nWager: <b>~$${approxBetUSD}</b>\n\nPlease place your bet:`;
+        
+        const imageUrl = 'https://i.postimg.cc/x8Njx95p/roulette-table-1.png';
+
+        const sentMsg = await bot.sendPhoto(session.chat_id, imageUrl, {
+            caption: captionText,
+            parse_mode: 'HTML',
+            reply_markup: generateRouletteBettingKeyboard(mainBotGameId)
+        });
+
+        // --- END OF MODIFICATION ---
         
         gameState.helperMessageId = sentMsg.message_id;
         await client.query("UPDATE roulette_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
@@ -101,19 +109,28 @@ async function processBet(gameId, betKey, clickerId) {
         const isWin = betInfo.numbers.includes(resultNumber);
         
         gameState.outcome = isWin ? 'win' : 'loss';
+        // Main bot calculates actual payout, helper just provides multiplier
         gameState.payoutMultiplier = isWin ? (1 + betInfo.payout) : 0;
 
-        await bot.editMessageText(`Spinning for your bet on <b>${escapeHTML(betInfo.name)}</b>...`, { chat_id: session.chat_id, message_id: gameState.helperMessageId, parse_mode: 'HTML' });
+        // --- START OF MODIFICATION ---
+        // We will now edit the caption of the existing photo message
+        const spinningText = `Player: ${escapeHTML(gameState.initiatorName)}\nBetting on: <b>${escapeHTML(betInfo.name)}</b>\n\n🎡 Spinning the wheel... No more bets!`;
+        await bot.editMessageCaption(spinningText, { chat_id: session.chat_id, message_id: gameState.helperMessageId, parse_mode: 'HTML' });
+        // --- END OF MODIFICATION ---
+        
         await sleep(1500);
         
         const stickerId = ROULETTE_NUMBER_STICKERS[resultNumber] || ROULETTE_NUMBER_STICKERS.default;
-        await bot.sendSticker(session.chat_id, stickerId);
+        // Reply to the photo message with the sticker for context
+        await bot.sendSticker(session.chat_id, stickerId, { reply_to_message_id: gameState.helperMessageId });
         await sleep(4000);
 
         await client.query("UPDATE roulette_sessions SET status = $1, game_state_json = $2 WHERE session_id = $3", [`completed_${gameState.outcome}`, JSON.stringify(gameState), session.session_id]);
         await client.query('COMMIT');
         
-        await bot.deleteMessage(session.chat_id, gameState.helperMessageId).catch(()=>{});
+        // The main bot will now take over, so we don't need to delete the photo from the helper
+        // await bot.deleteMessage(session.chat_id, gameState.helperMessageId).catch(()=>{});
+        
     } catch (e) {
         if(client) await client.query('ROLLBACK');
         console.error(`${logPrefix} Error processing bet: ${e.message}`);
@@ -122,8 +139,6 @@ async function processBet(gameId, betKey, clickerId) {
     }
 }
 
-// --- START OF FIX ---
-// New function to handle cancelling the game
 async function handleCancel(gameId, clickerId) {
     let client = null;
     try {
@@ -136,9 +151,12 @@ async function handleCancel(gameId, clickerId) {
         if (String(session.user_id) !== String(clickerId)) { await client.query('ROLLBACK'); return; }
         
         const gameState = session.game_state_json || {};
-        await bot.editMessageText('🎡 Roulette game cancelled by player.', { chat_id: session.chat_id, message_id: gameState.helperMessageId, reply_markup: {} });
+        
+        // --- START OF MODIFICATION ---
+        // Edit the caption of the photo instead of sending a new message
+        await bot.editMessageCaption('🎡 Roulette game cancelled by player.', { chat_id: session.chat_id, message_id: gameState.helperMessageId, reply_markup: {} });
+        // --- END OF MODIFICATION ---
 
-        // Update the status to completed_loss, the main bot will see this and refund the bet (as payout is 0)
         gameState.outcome = 'cancelled';
         await client.query("UPDATE roulette_sessions SET status = 'completed_loss', game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
         await client.query('COMMIT');
@@ -150,8 +168,6 @@ async function handleCancel(gameId, clickerId) {
         if(client) client.release();
     }
 }
-// --- END OF FIX ---
-
 
 async function listen() {
     const client = await pool.connect();
@@ -161,7 +177,7 @@ async function listen() {
                 const payload = JSON.parse(msg.payload);
                 if (payload.main_bot_game_id) {
                     console.log(`[HelperListener] Received pickup notification for GID: ${payload.main_bot_game_id}`);
-                    handleNewGame(payload.main_bot_game_id);
+                    handleNewGameSession(payload.main_bot_game_id);
                 }
             } catch (e) { console.error('Error parsing notification payload:', e); }
         }
@@ -175,16 +191,13 @@ bot.on('callback_query', async (callbackQuery) => {
     const clickerId = String(callbackQuery.from.id);
 
     if (action === 'roulette_bet') {
-        await bot.answerCallbackQuery(callbackQuery.id).catch(()=>{});
+        // No need to answer, processBet will edit the message
         await processBet(gameId, betKey, clickerId);
     } 
-    // --- START OF FIX ---
-    // Handle the cancel action
     else if (action === 'roulette_cancel') {
         await bot.answerCallbackQuery(callbackQuery.id, {text: "Cancelling game..."}).catch(()=>{});
         await handleCancel(gameId, clickerId);
     }
-    // --- END OF FIX ---
 });
 
 listen().catch(err => {
